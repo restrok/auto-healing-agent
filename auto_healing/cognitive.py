@@ -21,6 +21,26 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "https://ollama.com/v1")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 MODEL_NAME = os.getenv("LLM_MODEL", "deepseek-v4.1-flash")
 
+DEFAULT_LLM_CALL_TIMEOUT: float = 45.0
+DEFAULT_RECOVERY_TIMEOUT: float = 60.0
+
+
+def get_llm_call_timeout() -> float:
+    """Returns the LLM call timeout in seconds from LLM_CALL_TIMEOUT env var (fallback: 45.0s)."""
+    try:
+        return float(os.getenv("LLM_CALL_TIMEOUT", str(DEFAULT_LLM_CALL_TIMEOUT)))
+    except (ValueError, TypeError):
+        return DEFAULT_LLM_CALL_TIMEOUT
+
+
+def get_recovery_timeout() -> float:
+    """Returns the circuit breaker recovery timeout in seconds from CIRCUIT_BREAKER_RECOVERY_TIMEOUT env var (fallback: 60.0s)."""
+    try:
+        return float(os.getenv("CIRCUIT_BREAKER_RECOVERY_TIMEOUT", str(DEFAULT_RECOVERY_TIMEOUT)))
+    except (ValueError, TypeError):
+        return DEFAULT_RECOVERY_TIMEOUT
+
+
 CORE_DB_CONTAINER = os.getenv("CORE_DB_CONTAINER", "core-db-1")
 CORE_LLM_CONTAINER = os.getenv("CORE_LLM_CONTAINER", "core-llm-1")
 CORE_BRAIN_CONTAINER = os.getenv("CORE_BRAIN_CONTAINER", "core-brain-1")
@@ -66,12 +86,12 @@ class CircuitBreaker:
     def __init__(
         self,
         failure_threshold: int = 2,
-        recovery_timeout: float = 60.0,
-        call_timeout: float = 2.0,
+        recovery_timeout: Optional[float] = None,
+        call_timeout: Optional[float] = None,
     ) -> None:
         self.failure_threshold: int = failure_threshold
-        self.recovery_timeout: float = recovery_timeout
-        self.call_timeout: float = call_timeout
+        self.recovery_timeout: float = recovery_timeout if recovery_timeout is not None else get_recovery_timeout()
+        self.call_timeout: float = call_timeout if call_timeout is not None else get_llm_call_timeout()
         self.state: CircuitState = CircuitState.CLOSED
         self.failure_count: int = 0
         self.last_failure_time: Optional[float] = None
@@ -171,16 +191,29 @@ class CircuitBreaker:
 
 
 # Module-level default circuit breaker
-default_circuit_breaker = CircuitBreaker(
-    failure_threshold=2,
-    recovery_timeout=60.0,
-    call_timeout=2.0,
-)
+default_circuit_breaker = CircuitBreaker()
+
+
+def is_diagnosis_available(diagnosis: Optional[Dict[str, Any]]) -> bool:
+    """Returns True if the diagnosis is available and ready for remediation.
+
+    Returns False if diagnosis is None, status is 'unavailable', or worker_task is missing.
+    """
+    if not diagnosis or not isinstance(diagnosis, dict):
+        return False
+    if diagnosis.get("status") == "unavailable":
+        return False
+    return bool(diagnosis.get("worker_task"))
 
 
 def get_tier1_remediation(target_name: str, issue_description: str = "") -> Dict[str, Any]:
     """Returns deterministic safe-mode remediation adhering to bootstrap dependency order:
     docker.service -> core-db-1 -> core-llm-1 -> core-brain-1 / core-scheduler-1
+
+    NOTE: This is reserved strictly for deterministic bootstrap recovery (Tier-1 bootstrap),
+    such as the anti-circular dependency guard. An agent whose reasoning engine fails must
+    abstain, not emit a blind fix. Therefore, this function must NEVER be automatically
+    invoked as a fallback when cognitive LLM analysis fails.
     """
     clean_target = (target_name or "").strip().lower()
 
@@ -189,6 +222,7 @@ def get_tier1_remediation(target_name: str, issue_description: str = "") -> Dict
         "docker" in clean_target and "core" not in clean_target
     ):
         return {
+            "status": "available",
             "title": "Tier 1: Recuperación de Docker Daemon",
             "root_cause": f"Falla de servicio Docker o socket daemon inaccesible. {issue_description}".strip(),
             "recommended_fix": "Reiniciar el servicio docker.service mediante systemctl en el host.",
@@ -200,6 +234,7 @@ def get_tier1_remediation(target_name: str, issue_description: str = "") -> Dict
     # 2. Database service recovery (root dependency)
     if clean_target == CORE_DB_CONTAINER.lower() or "neo4j" in clean_target or "core-db" in clean_target:
         return {
+            "status": "available",
             "title": "Tier 1: Bootstrap Graph Database",
             "root_cause": f"Base de datos inaccesible o no saludable (dependencia raíz del sistema). {issue_description}".strip(),
             "recommended_fix": f"Reiniciar contenedor {CORE_DB_CONTAINER} y verificar disponibilidad en puerto 7474.",
@@ -211,6 +246,7 @@ def get_tier1_remediation(target_name: str, issue_description: str = "") -> Dict
     # 3. LLM / inference service recovery
     if clean_target == CORE_LLM_CONTAINER.lower() or "ollama" in clean_target or "core-llm" in clean_target:
         return {
+            "status": "available",
             "title": "Tier 1: Bootstrap LLM Service",
             "root_cause": f"Servicio LLM inaccesible o saturado; falla de inferencia o embeddings locales. {issue_description}".strip(),
             "recommended_fix": f"Reiniciar contenedor {CORE_LLM_CONTAINER} tras validar servicio base Docker.",
@@ -222,6 +258,7 @@ def get_tier1_remediation(target_name: str, issue_description: str = "") -> Dict
     # 4. Core Brain recovery
     if clean_target == CORE_BRAIN_CONTAINER.lower() or "brain" in clean_target:
         return {
+            "status": "available",
             "title": "Tier 1: Bootstrap Brain Engine",
             "root_cause": f"Servicio Brain Engine degradado o no responde; requiere validar {CORE_DB_CONTAINER}. {issue_description}".strip(),
             "recommended_fix": f"Verificar salud de {CORE_DB_CONTAINER} y reiniciar {CORE_BRAIN_CONTAINER}.",
@@ -233,6 +270,7 @@ def get_tier1_remediation(target_name: str, issue_description: str = "") -> Dict
     # 5. Core Scheduler recovery
     if clean_target == CORE_SCHEDULER_CONTAINER.lower() or "scheduler" in clean_target:
         return {
+            "status": "available",
             "title": "Tier 1: Bootstrap Scheduler",
             "root_cause": f"Scheduler degradado; depende de {CORE_DB_CONTAINER} y {CORE_BRAIN_CONTAINER} para tareas periódicas. {issue_description}".strip(),
             "recommended_fix": f"Reiniciar contenedor {CORE_SCHEDULER_CONTAINER} tras validar base de datos y Brain.",
@@ -241,7 +279,7 @@ def get_tier1_remediation(target_name: str, issue_description: str = "") -> Dict
             "tier": "tier1",
         }
 
-    # 6. Safe fallback for other containers
+    # 6. Safe fallback for other containers in explicit deterministic bootstrap
     target_orig = target_name or "contenedor"
     if clean_target.startswith("app"):
         project = "app-platform"
@@ -260,6 +298,7 @@ def get_tier1_remediation(target_name: str, issue_description: str = "") -> Dict
         fix = f"Reiniciar contenedor {target_orig} y auditar estado post-reinicio."
 
     return {
+        "status": "available",
         "title": f"Tier 1: Remediación estándar para {target_orig}",
         "root_cause": f"Anomalía persistente detectada en {target_orig}: {issue_description or 'Contenedor en estado degradado o errores en logs.'}".strip(),
         "recommended_fix": fix,
@@ -277,28 +316,46 @@ def analyze_log_anomaly(
 ) -> Dict[str, Any]:
     """Uses LLM with strict circuit breaker and negative constraints to diagnose errors.
 
-    Falls back deterministically to get_tier1_remediation on:
-    - Anti-circular dependency trigger (container is LLM/Core service).
-    - Circuit breaker OPEN (fast-fail).
-    - HTTP timeout / connection error / non-zero code.
-    - LLM output proposing a discarded hypothesis (post-filter veto).
+    Core Invariant:
+        Un agente cuyo motor de razonamiento falla debe abstenerse, no emitir un fix ciego.
+        When cognitive diagnosis fails (timeout, circuit breaker OPEN, network error,
+        or malformed/rejected response), the agent MUST abstain by returning an explicit
+        unavailable status (status='unavailable') rather than emitting a blind, ungrounded
+        remediation action.
+
+    Deterministic Bootstrap (Tier-1):
+        get_tier1_remediation() is reserved strictly for explicit bootstrap dependencies
+        (e.g., anti-circular dependency guard when core services like DB/LLM are degraded).
+        It is never used as a fallback for reasoning engine failures.
+
+    Returns:
+        Dict[str, Any]: A valid diagnosis dict with keys ('title', 'root_cause', 'recommended_fix',
+                        'worker_task', 'target_project', 'status': 'available') on success or Tier-1 bootstrap,
+                        or {'status': 'unavailable', 'reason': str, 'container': str} upon failure/abstention.
     """
     cb = circuit_breaker or default_circuit_breaker
 
-    # 1. Anti-circular dependency guard
+    # 1. Anti-circular dependency guard (explicit deterministic bootstrap path)
     if container_name in CORE_SERVICES:
         logger.warning(
             f"Anti-circular dependency triggered for {container_name}: bypassing LLM and invoking Tier 1 remediation."
         )
-        return get_tier1_remediation(container_name, f"Circular dependency safeguard for {container_name}")
+        res = get_tier1_remediation(container_name, f"Circular dependency safeguard for {container_name}")
+        res["status"] = "available"
+        return res
 
-    # 2. Fast-fail if circuit breaker is already OPEN
+    # 2. Fast-fail if circuit breaker is already OPEN (abstention)
     if not cb.can_execute():
-        logger.warning(f"Circuit breaker is OPEN for cognitive analysis of {container_name}. Fast-failing to Tier 1.")
-        return get_tier1_remediation(
-            container_name,
-            f"Circuit breaker is OPEN (fast-fail, recovery timeout {cb.recovery_timeout}s)",
+        reason = f"Circuit breaker is OPEN (fast-fail, recovery timeout {cb.recovery_timeout}s)"
+        logger.warning(
+            f"Cognitive analysis abstention for {container_name}: {reason}. "
+            "Reasoning engine unavailable; abstaining from emitting ungrounded remediation."
         )
+        return {
+            "status": "unavailable",
+            "reason": reason,
+            "container": container_name,
+        }
 
     # 3. Format input logs
     if isinstance(log_snippet, list):
@@ -318,9 +375,9 @@ def analyze_log_anomaly(
         for h in discarded_hypotheses:
             if isinstance(h, dict):
                 val = h.get("worker_task") or h.get("action") or h.get("recommended_fix") or h.get("title")
-                if val:
+                if val and val != "N/A" and not str(val).startswith("N/A"):
                     discarded_text_list.append(str(val))
-            elif isinstance(h, str):
+            elif isinstance(h, str) and h != "N/A":
                 discarded_text_list.append(h)
 
         if discarded_text_list:
@@ -390,8 +447,16 @@ Respond strictly in valid JSON format with the following keys:
     try:
         parsed = cb.execute(_do_http_call)
     except Exception as exc:
-        logger.error(f"Cognitive analysis failed through circuit breaker for {container_name}: {exc}")
-        return get_tier1_remediation(container_name, f"Cognitive service unavailable or failed: {exc}")
+        reason = f"Cognitive service failed or timed out: {exc}"
+        logger.error(
+            f"Cognitive analysis failed through circuit breaker for {container_name}: {exc}. "
+            "Abstaining from emitting remediation plan."
+        )
+        return {
+            "status": "unavailable",
+            "reason": reason,
+            "container": container_name,
+        }
 
     required_keys = {
         "title",
@@ -401,8 +466,16 @@ Respond strictly in valid JSON format with the following keys:
         "target_project",
     }
     if not isinstance(parsed, dict) or not required_keys.issubset(parsed.keys()):
-        logger.warning(f"Cognitive analysis returned incomplete JSON schema for {container_name}: {parsed}")
-        return get_tier1_remediation(container_name, "Incomplete diagnosis format from LLM")
+        reason = f"Incomplete diagnosis schema from LLM: {parsed}"
+        logger.warning(
+            f"Cognitive analysis returned incomplete JSON schema for {container_name}: {parsed}. "
+            "Abstaining from emitting remediation plan."
+        )
+        return {
+            "status": "unavailable",
+            "reason": reason,
+            "container": container_name,
+        }
 
     # Post-filter validation against discarded hypotheses
     if discarded_text_list:
@@ -411,13 +484,16 @@ Respond strictly in valid JSON format with the following keys:
         for d in discarded_text_list:
             d_lower = d.lower().strip()
             if d_lower and (d_lower in proposed_task or d_lower in proposed_fix or proposed_task in d_lower):
+                reason = f"Vetoed discarded hypothesis: {d}"
                 logger.warning(
-                    f"LLM proposed a discarded hypothesis ('{d}') for {container_name}. Vetoing and falling back to Tier 1."
+                    f"LLM proposed a discarded hypothesis ('{d}') for {container_name}. Abstaining: {reason}."
                 )
-                return get_tier1_remediation(
-                    container_name,
-                    f"Vetoed discarded hypothesis: {d}",
-                )
+                return {
+                    "status": "unavailable",
+                    "reason": reason,
+                    "container": container_name,
+                }
 
+    parsed["status"] = "available"
     logger.info(f"✅ Diagnosis generated for {container_name}: {parsed.get('title')}")
     return parsed
