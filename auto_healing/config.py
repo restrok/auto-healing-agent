@@ -2,7 +2,8 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.getenv("HEAL_DB_PATH", str(BASE_DIR / "healing_history.sqlite")))
+REPO_DIR = BASE_DIR.parent
+DB_PATH = Path(os.getenv("HEALING_DB_PATH", os.getenv("HEAL_DB_PATH", "./healing_history.sqlite")))
 
 DISK_USAGE_WARN_PERCENT = float(os.getenv("HEAL_DISK_WARN", "75.0"))
 DISK_USAGE_CRIT_PERCENT = float(os.getenv("HEAL_DISK_CRIT", "85.0"))
@@ -12,6 +13,9 @@ SWAP_USED_MAX_MB = float(os.getenv("HEAL_SWAP_MAX_MB", "4000.0"))
 MAX_REMEDIATIONS_PER_RUN = int(os.getenv("HEAL_MAX_REMEDIATIONS", "2"))
 COOLDOWN_SECONDS = int(os.getenv("HEAL_COOLDOWN_SEC", "20"))
 LOG_SCAN_HOURS = int(os.getenv("HEAL_LOG_SCAN_HOURS", "24"))
+
+LLM_CALL_TIMEOUT = float(os.getenv("LLM_CALL_TIMEOUT", "45.0"))
+CIRCUIT_BREAKER_RECOVERY_TIMEOUT = float(os.getenv("CIRCUIT_BREAKER_RECOVERY_TIMEOUT", "60.0"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

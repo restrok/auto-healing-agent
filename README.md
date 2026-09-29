@@ -82,10 +82,12 @@ cp .env.example .env
 | `OLLAMA_BASE_URL` | Optional | `https://ollama.com/v1` | OpenAI-compatible endpoint for LLM anomaly diagnosis |
 | `OLLAMA_API_KEY` | Optional | *None* | Bearer authentication key for remote LLM inference |
 | `LLM_MODEL` | Optional | `deepseek-v4.1-flash` | Model identifier for root cause analysis |
+| `LLM_CALL_TIMEOUT` | Optional | `45.0` | Maximum call timeout in seconds for cognitive LLM inference calls |
+| `CIRCUIT_BREAKER_RECOVERY_TIMEOUT` | Optional | `60.0` | Cooldown period in seconds before circuit breaker transitions OPEN to HALF_OPEN |
 | `ORCHESTRATOR_API_URL` | Optional | `http://localhost:8001` | Base URL of the Agent Orchestrator API for HITL plans |
 | `ORCHESTRATOR_DB_PATH` | Optional | `./data/orchestrator.db` | Path to orchestrator SQLite database for rejection sync |
 | `REQUESTER_ID` | Optional | `auto-healer` | Requester identification string for registered plans |
-| `HEAL_DB_PATH` | Optional | `./healing_history.sqlite` | SQLite database file storing run history and evidence memory |
+| `HEALING_DB_PATH` | Optional | `./healing_history.sqlite` | SQLite database file storing run history and evidence memory (legacy `HEAL_DB_PATH` supported) |
 | `HEAL_DISK_WARN` | Optional | `75.0` | Disk usage percentage threshold for warnings |
 | `HEAL_DISK_CRIT` | Optional | `85.0` | Disk usage percentage threshold for critical alerts |
 | `HEAL_MEM_MIN_MB` | Optional | `1500.0` | Minimum available RAM in MB before raising an alert |
