@@ -17,7 +17,7 @@ if __name__ == "__main__" and __package__ is None:
         record_failed_action,
         record_rejected_hypothesis,
     )
-    from auto_healing.cognitive import analyze_log_anomaly
+    from auto_healing.cognitive import analyze_log_anomaly, is_diagnosis_available
     from auto_healing.config import DB_PATH, MAX_REMEDIATIONS_PER_RUN
     from auto_healing.critic import lint_remediation_proposal
     from auto_healing.diagnostics import run_full_diagnostics
@@ -33,7 +33,7 @@ else:
         record_failed_action,
         record_rejected_hypothesis,
     )
-    from .cognitive import analyze_log_anomaly
+    from .cognitive import analyze_log_anomaly, is_diagnosis_available
     from .config import DB_PATH, MAX_REMEDIATIONS_PER_RUN
     from .critic import lint_remediation_proposal
     from .diagnostics import run_full_diagnostics
@@ -209,6 +209,31 @@ def main():
             if samples:
                 discarded = get_discarded_hypotheses(c_name, window_cycles=3, db_path=DB_PATH)
                 diagnosis = analyze_log_anomaly(c_name, samples, discarded_hypotheses=discarded)
+
+                # Invariant: Un agente cuyo motor de razonamiento falla debe abstenerse, no emitir un fix ciego.
+                if not is_diagnosis_available(diagnosis):
+                    reason = (
+                        diagnosis.get("reason", "Unknown failure")
+                        if isinstance(diagnosis, dict)
+                        else "No diagnosis returned"
+                    )
+                    logger.warning(
+                        f"⚠️ Diagnóstico no disponible - abstención para {c_name}: {reason}. "
+                        "No se genera plan de remediación ni se notifica a HITL/Telegram."
+                    )
+                    record_rejected_hypothesis(
+                        container_name=c_name,
+                        hypothesis_title="Diagnóstico no disponible",
+                        recommended_fix="N/A (Abstención del motor cognitivo)",
+                        worker_task="N/A",
+                        rejection_source="COGNITIVE_ABSTENTION",
+                        rejection_reason=f"Diagnóstico no disponible - abstención: {reason}",
+                        run_id=run_id,
+                        action_type="cognitive_diagnosis",
+                        error_msg=reason,
+                        db_path=DB_PATH,
+                    )
+                    continue
 
                 # Pre-flight screening of cognitive proposal before submitting HITL plan
                 worker_task = diagnosis.get("worker_task", "")
