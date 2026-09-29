@@ -39,6 +39,7 @@ from auto_healing.cognitive import (
     CircuitState,
     analyze_log_anomaly,
     get_tier1_remediation,
+    is_diagnosis_available,
 )
 from auto_healing.critic import (
     VIOLATION_DESTRUCTIVE_COMMAND,
@@ -273,7 +274,7 @@ class TestTier2BoundaryAndCornerCases(HermeticTestBase):
     """Tier 2: Boundary value analysis and edge condition stress."""
 
     def test_tier2_circuit_breaker_0ms_fast_fail(self) -> None:
-        """Boundary: When circuit breaker is OPEN, analyze_log_anomaly fast-fails in < 0.05s."""
+        """Boundary: When circuit breaker is OPEN, analyze_log_anomaly fast-fails in < 0.05s and abstains."""
         cb = CircuitBreaker(failure_threshold=1, recovery_timeout=60.0, call_timeout=0.5)
         cb.record_failure()
         self.assertEqual(cb.state, CircuitState.OPEN)
@@ -287,7 +288,9 @@ class TestTier2BoundaryAndCornerCases(HermeticTestBase):
         elapsed = time.time() - start
 
         self.assertLess(elapsed, 0.05, "OPEN circuit breaker must fast-fail in < 50ms")
-        self.assertEqual(res["target_project"], "homelab")
+        self.assertEqual(res["status"], "unavailable")
+        self.assertIn("Circuit breaker is OPEN", res["reason"])
+        self.assertFalse(is_diagnosis_available(res))
 
     def test_tier2_exact_12_and_64_char_hex_detection(self) -> None:
         """Boundary: Exact 12-char and 64-char hex strings are flagged, but not 11-char or non-hex."""
@@ -351,30 +354,34 @@ class TestTier3CrossFeatureCombinations(HermeticTestBase):
     """Tier 3: Pairwise integration across circuit breaker, critic, and evidence memory."""
 
     def test_tier3_circuit_breaker_tripped_and_critic_pre_flight(self) -> None:
-        """Cross: When circuit breaker trips, Tier 1 fallback task passes pre-flight Critic audit."""
+        """Cross: When circuit breaker trips, analyze_log_anomaly abstains; explicit Tier 1 bootstrap passes Critic audit."""
         cb = CircuitBreaker(failure_threshold=1, recovery_timeout=60.0, call_timeout=0.5)
         cb.record_failure()
         self.assertEqual(cb.state, CircuitState.OPEN)
 
-        # Trigger fallback
+        # Trigger cognitive call with OPEN circuit breaker -> must abstain
         diagnosis = analyze_log_anomaly(
             container_name="app-api",
             log_snippet=["Worker process exited with code 1"],
             circuit_breaker=cb,
         )
+        self.assertEqual(diagnosis.get("status"), "unavailable")
+        self.assertFalse(is_diagnosis_available(diagnosis))
 
-        task = diagnosis.get("worker_task", "")
-        self.assertTrue(task, "Tier 1 must generate a non-empty worker task")
+        # Explicit deterministic bootstrap remediation passes pre-flight Critic audit
+        tier1 = get_tier1_remediation("app-api")
+        task = tier1.get("worker_task", "")
+        self.assertTrue(task, "Tier 1 bootstrap must generate a non-empty worker task")
 
         # Pre-flight audit Tier 1 generated task
         critic_verdict = lint_remediation_proposal(task, target_container="app-api")
         self.assertTrue(
             critic_verdict.is_valid,
-            f"Tier 1 fallback task must pass pre-flight Critic audit without violations: {critic_verdict.rejection_reason}",
+            f"Tier 1 bootstrap task must pass pre-flight Critic audit without violations: {critic_verdict.rejection_reason}",
         )
 
     def test_tier3_discarded_hypothesis_veto_with_tier1_fallback(self) -> None:
-        """Cross: 3-cycle discarded hypothesis vetoes candidate and triggers Tier 1 fallback."""
+        """Cross: 3-cycle discarded hypothesis vetoes candidate and triggers cognitive abstention."""
         container = "app-api"
         # Record a discarded restart
         record_rejected_hypothesis(
@@ -413,9 +420,10 @@ class TestTier3CrossFeatureCombinations(HermeticTestBase):
                 discarded_hypotheses=discarded,
             )
 
-            # The cognitive module must VETO the LLM output and fall back to Tier 1
-            self.assertEqual(diag.get("tier"), "tier1")
-            self.assertIn("Vetoed discarded hypothesis", diag.get("root_cause", ""))
+            # The cognitive module must VETO the LLM output and abstain (invariant)
+            self.assertEqual(diag.get("status"), "unavailable")
+            self.assertIn("Vetoed discarded hypothesis", diag.get("reason", ""))
+            self.assertFalse(is_diagnosis_available(diag))
 
     def test_tier3_audit_failure_persists_to_evidence_and_updates_pruning(self) -> None:
         """Cross: Audit failure verdict directly persists to evidence and marks action discarded."""
@@ -522,9 +530,73 @@ class TestTier4RealWorldHomelabAcceptance(HermeticTestBase):
                 5.0,
                 f"Auto-healing cycle exceeded 5.0s during Ollama outage (took {elapsed_time:.2f}s)",
             )
+            # Cognitive LLM failure -> Agent must abstain and NOT generate blind HITL plan
+            mock_hitl.assert_not_called()
+
+            # Verify failure was recorded in evidence memory (SQLite rejected_hypotheses)
+            conn = sqlite3.connect(str(self.db_path))
+            cursor = conn.cursor()
+            abstentions = cursor.execute(
+                "SELECT container_name, rejection_source, rejection_reason FROM rejected_hypotheses WHERE rejection_source = 'COGNITIVE_ABSTENTION'"
+            ).fetchall()
+            conn.close()
+            self.assertGreaterEqual(len(abstentions), 1)
+            self.assertEqual(abstentions[0][0], "app-api")
+            self.assertIn("abstención", abstentions[0][2].lower())
+
+    @patch("auto_healing.healer.send_telegram_digest")
+    @patch("auto_healing.healer.submit_hitl_approval_plan")
+    @patch("auto_healing.healer.run_full_diagnostics")
+    def test_scenario_1b_successful_llm_diagnosis_generates_hitl_plan(
+        self,
+        mock_diag: MagicMock,
+        mock_hitl: MagicMock,
+        mock_telegram: MagicMock,
+    ) -> None:
+        """Scenario 1b (Normal flow): Operational LLM -> Generates valid diagnosis and HITL plan."""
+        mock_hitl.return_value = "plan_test_s1b"
+        mock_telegram.return_value = True
+
+        mock_diag.return_value = {
+            "timestamp": "2026-09-24T03:00:00Z",
+            "host": {"disk": {"status": "OK"}},
+            "containers_running": 14,
+            "containers_total": 14,
+            "unhealthy_containers": [],
+            "degraded_containers": [],
+            "log_anomalies": [
+                {
+                    "container": "app-api",
+                    "sample_errors": ["Database pool exhausted on 127.0.0.1:5432"],
+                }
+            ],
+        }
+
+        mock_llm_response = {
+            "title": "Ajustar pool de base de datos",
+            "root_cause": "Conexiones agotadas",
+            "recommended_fix": "Aumentar max_connections a 100",
+            "worker_task": "sed -i 's/max_conn=20/max_conn=100/g' /app/config.py",
+            "target_project": "app-platform",
+        }
+
+        with (
+            patch("auto_healing.cognitive.urllib.request.urlopen") as mock_urlopen,
+            patch.object(healer, "DB_PATH", str(self.db_path)),
+        ):
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(
+                {"choices": [{"message": {"content": json.dumps(mock_llm_response)}}]}
+            ).encode("utf-8")
+            mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+            with patch("sys.argv", ["healer.py"]):
+                healer.main()
+
             mock_hitl.assert_called_once()
             plan_arg = mock_hitl.call_args[0][0]
             self.assertEqual(plan_arg["target_project"], "app-platform")
+            self.assertEqual(plan_arg["title"], "Ajustar pool de base de datos")
 
     def test_scenario_2_container_crash_loop_3_cycle_veto(self) -> None:
         """Scenario 2 (Acceptance R2): Container crash loop fails audit, excluded from next 3 cycles."""

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 import urllib.error
 
+import os
 from auto_healing.cognitive import (
     BOOTSTRAP_DEPENDENCY_ORDER,
     CircuitBreaker,
@@ -12,6 +13,7 @@ from auto_healing.cognitive import (
     CircuitState,
     analyze_log_anomaly,
     get_tier1_remediation,
+    is_diagnosis_available,
 )
 
 
@@ -42,6 +44,36 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertEqual(self.breaker.failure_count, 0)
         self.assertIsNone(self.breaker.last_failure_time)
         self.assertTrue(self.breaker.can_execute())
+
+    def test_default_call_timeout_is_45s(self):
+        # Without env var, default call_timeout is 45.0s and recovery_timeout is 60.0s
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LLM_CALL_TIMEOUT", None)
+            os.environ.pop("CIRCUIT_BREAKER_RECOVERY_TIMEOUT", None)
+            cb = CircuitBreaker()
+            try:
+                self.assertEqual(cb.call_timeout, 45.0)
+                self.assertEqual(cb.recovery_timeout, 60.0)
+            finally:
+                cb.close()
+
+    def test_llm_call_timeout_env_var_override(self):
+        # Setting LLM_CALL_TIMEOUT overrides default call_timeout
+        with patch.dict(os.environ, {"LLM_CALL_TIMEOUT": "25.5"}):
+            cb = CircuitBreaker()
+            try:
+                self.assertEqual(cb.call_timeout, 25.5)
+            finally:
+                cb.close()
+
+    def test_circuit_breaker_recovery_timeout_env_override(self):
+        # Setting CIRCUIT_BREAKER_RECOVERY_TIMEOUT overrides default recovery_timeout
+        with patch.dict(os.environ, {"CIRCUIT_BREAKER_RECOVERY_TIMEOUT": "120.0"}):
+            cb = CircuitBreaker()
+            try:
+                self.assertEqual(cb.recovery_timeout, 120.0)
+            finally:
+                cb.close()
 
     def test_record_success_in_closed(self):
         self.breaker.failure_count = 1
@@ -266,8 +298,9 @@ class TestAnalyzeLogAnomaly(unittest.TestCase):
         )
 
         mock_urlopen.assert_not_called()
-        self.assertEqual(res["tier"], "tier1")
-        self.assertIn("Circuit breaker is OPEN", res["root_cause"])
+        self.assertEqual(res["status"], "unavailable")
+        self.assertIn("Circuit breaker is OPEN", res["reason"])
+        self.assertFalse(is_diagnosis_available(res))
 
     @patch("urllib.request.urlopen")
     def test_fallback_on_network_error_trips_breaker(self, mock_urlopen):
@@ -278,7 +311,9 @@ class TestAnalyzeLogAnomaly(unittest.TestCase):
             "502 Bad Gateway",
             circuit_breaker=self.breaker,
         )
-        self.assertEqual(res1["tier"], "tier1")
+        self.assertEqual(res1["status"], "unavailable")
+        self.assertIn("Connection refused", res1["reason"])
+        self.assertFalse(is_diagnosis_available(res1))
         self.assertEqual(self.breaker.failure_count, 1)
 
         res2 = analyze_log_anomaly(
@@ -286,7 +321,7 @@ class TestAnalyzeLogAnomaly(unittest.TestCase):
             "502 Bad Gateway",
             circuit_breaker=self.breaker,
         )
-        self.assertEqual(res2["tier"], "tier1")
+        self.assertEqual(res2["status"], "unavailable")
         self.assertEqual(self.breaker.failure_count, 2)
         self.assertEqual(self.breaker.state, CircuitState.OPEN)
 
@@ -362,9 +397,52 @@ class TestAnalyzeLogAnomaly(unittest.TestCase):
             circuit_breaker=self.breaker,
         )
 
-        # Because LLM proposed the discarded hypothesis, post-filter vetoes it and returns Tier 1
-        self.assertEqual(res["tier"], "tier1")
-        self.assertIn("Vetoed discarded hypothesis", res["root_cause"])
+        # Because LLM proposed the discarded hypothesis, post-filter vetoes it and abstains
+        self.assertEqual(res["status"], "unavailable")
+        self.assertIn("Vetoed discarded hypothesis", res["reason"])
+        self.assertFalse(is_diagnosis_available(res))
+
+    @patch("urllib.request.urlopen")
+    def test_abstention_on_invalid_json_schema(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": json.dumps({"incomplete": "data"})}}]}
+        ).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        res = analyze_log_anomaly(
+            "worker-svc",
+            "SyntaxError detected",
+            circuit_breaker=self.breaker,
+        )
+        self.assertEqual(res["status"], "unavailable")
+        self.assertIn("Incomplete diagnosis schema", res["reason"])
+        self.assertFalse(is_diagnosis_available(res))
+
+    @patch("urllib.request.urlopen")
+    def test_normal_flow_generates_diagnosis_successfully(self, mock_urlopen):
+        valid_payload = {
+            "title": "Fix Memory Buffer",
+            "root_cause": "Buffer saturado",
+            "recommended_fix": "Incrementar límite de memoria",
+            "worker_task": "sed -i 's/512M/1024M/g' /etc/app.conf",
+            "target_project": "homelab",
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": json.dumps(valid_payload)}}]}
+        ).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        res = analyze_log_anomaly(
+            "worker-svc",
+            "Memory limit warning",
+            circuit_breaker=self.breaker,
+        )
+        self.assertEqual(res["status"], "available")
+        self.assertTrue(is_diagnosis_available(res))
+        self.assertEqual(res["title"], "Fix Memory Buffer")
+        self.assertEqual(res["worker_task"], "sed -i 's/512M/1024M/g' /etc/app.conf")
 
 
 if __name__ == "__main__":

@@ -85,6 +85,91 @@ class TestAutoHealing(unittest.TestCase):
         self.assertIn("[ERROR]", res["sample_errors"][0])
         self.assertNotIn("[INFO]", res["sample_errors"][0])
 
+    @patch("auto_healing.healer.send_telegram_digest")
+    @patch("auto_healing.healer.save_run", return_value=1)
+    @patch("auto_healing.healer.submit_hitl_approval_plan")
+    @patch("auto_healing.healer.record_rejected_hypothesis")
+    @patch("auto_healing.healer.analyze_log_anomaly")
+    @patch("auto_healing.healer.get_discarded_hypotheses", return_value=[])
+    @patch("auto_healing.healer.run_full_diagnostics")
+    def test_healer_abstains_on_unavailable_diagnosis(
+        self,
+        mock_diag,
+        mock_discarded,
+        mock_analyze,
+        mock_record_rejected,
+        mock_submit_hitl,
+        mock_save_run,
+        mock_telegram,
+    ):
+        mock_diag.return_value = {
+            "timestamp": "2026-09-29T12:00:00Z",
+            "host": {"disk": {"status": "OK", "used_pct": 20.0, "free_gb": 80.0}, "memory": {}, "issues": []},
+            "containers_running": 5,
+            "containers_total": 5,
+            "unhealthy_containers": [],
+            "degraded_containers": [],
+            "log_anomalies": [{"container": "failing-svc", "sample_errors": ["Error 500"]}],
+        }
+        # Simulate LLM timeout/failure resulting in abstention
+        mock_analyze.return_value = {
+            "status": "unavailable",
+            "reason": "Call timed out after 45.0s",
+            "container": "failing-svc",
+        }
+
+        with patch("sys.argv", ["healer.py"]):
+            from auto_healing import healer
+
+            healer.main()
+
+        # Invariant: No HITL plan generated when cognitive diagnosis is unavailable
+        mock_submit_hitl.assert_not_called()
+        mock_record_rejected.assert_called_once()
+        args, kwargs = mock_record_rejected.call_args
+        self.assertEqual(kwargs.get("container_name"), "failing-svc")
+        self.assertEqual(kwargs.get("rejection_source"), "COGNITIVE_ABSTENTION")
+
+    @patch("auto_healing.healer.send_telegram_digest")
+    @patch("auto_healing.healer.save_run", return_value=1)
+    @patch("auto_healing.healer.submit_hitl_approval_plan", return_value="heal_12345")
+    @patch("auto_healing.healer.analyze_log_anomaly")
+    @patch("auto_healing.healer.get_discarded_hypotheses", return_value=[])
+    @patch("auto_healing.healer.run_full_diagnostics")
+    def test_healer_generates_plan_on_available_diagnosis(
+        self,
+        mock_diag,
+        mock_discarded,
+        mock_analyze,
+        mock_submit_hitl,
+        mock_save_run,
+        mock_telegram,
+    ):
+        mock_diag.return_value = {
+            "timestamp": "2026-09-29T12:00:00Z",
+            "host": {"disk": {"status": "OK", "used_pct": 20.0, "free_gb": 80.0}, "memory": {}, "issues": []},
+            "containers_running": 5,
+            "containers_total": 5,
+            "unhealthy_containers": [],
+            "degraded_containers": [],
+            "log_anomalies": [{"container": "web-svc", "sample_errors": ["DNS error"]}],
+        }
+        mock_analyze.return_value = {
+            "status": "available",
+            "title": "Fix DNS",
+            "root_cause": "Falla DNS",
+            "recommended_fix": "Reiniciar resolvconf",
+            "worker_task": "systemctl restart systemd-resolved",
+            "target_project": "homelab",
+        }
+
+        with patch("sys.argv", ["healer.py"]):
+            from auto_healing import healer
+
+            healer.main()
+
+        mock_submit_hitl.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
