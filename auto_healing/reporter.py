@@ -1,11 +1,10 @@
 import html
 import json
 import logging
-import urllib.parse
 import urllib.request
 from typing import Any
 
-from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from .config import NOTIFY_USER_ID, ORCHESTRATOR_API_URL
 
 logger = logging.getLogger("auto_healing.reporter")
 
@@ -80,17 +79,14 @@ def format_report_html(
 
 
 def send_telegram_digest(html_text: str) -> bool:
-    """Sends HTML notification via Telegram Bot API."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials not configured. Skipping notification.")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    """Sends HTML notification via centralized Orchestrator notify API."""
+    url = f"{ORCHESTRATOR_API_URL}/api/notify"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": html_text,
+        "user_id": NOTIFY_USER_ID,
+        "agent_id": "auto-healer",
+        "message": html_text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "raw": True,
     }
 
     try:
@@ -99,12 +95,12 @@ def send_telegram_digest(html_text: str) -> bool:
         with urllib.request.urlopen(req, timeout=10) as response:
             res_body = response.read().decode("utf-8")
             res_json = json.loads(res_body)
-            if res_json.get("ok"):
-                logger.info("✅ Telegram digest sent successfully")
+            if response.status == 200 and (res_json.get("status") == "success" or res_json.get("ok")):
+                logger.info("✅ Telegram digest sent successfully via Orchestrator")
                 return True
             else:
-                logger.error(f"Telegram API responded with error: {res_body}")
+                logger.error(f"Orchestrator API responded with error: {res_body}")
                 return False
     except Exception as e:
-        logger.error(f"Failed to send Telegram message: {e}")
+        logger.error(f"Failed to send Telegram message via Orchestrator: {e}")
         return False
