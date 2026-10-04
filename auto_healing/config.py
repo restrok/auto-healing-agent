@@ -19,6 +19,8 @@ CIRCUIT_BREAKER_RECOVERY_TIMEOUT = float(os.getenv("CIRCUIT_BREAKER_RECOVERY_TIM
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ORCHESTRATOR_API_URL = os.getenv("ORCHESTRATOR_API_URL", "http://localhost:8001").rstrip("/")
+NOTIFY_USER_ID = os.getenv("NOTIFY_USER_ID", "fsirio")
 
 
 def validate_telegram_config() -> None:
